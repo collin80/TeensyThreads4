@@ -56,8 +56,8 @@ First, include the library with
 ```
 
 A global variable `threads` of `class Threads` will be created and used to
-control the threading action. The library is hard-coded to support up to 16 threads,
-but this may be changed in the source code of Threads.cpp.
+control the threading action. Threads are kept in a linked list, so the number of
+threads is limited only by available memory.
 
 Threads are created by `threads.addThread()` with parameters:
 
@@ -110,8 +110,8 @@ void setTimeSlice(int id, unsigned int ticks) | Set the slice length time in tic
 void setDefaultTimeSlice(unsigned int ticks) |Set the slice length time in ticks for all new threads (1 tick = 1 millisecond, unless using MicroTimer)
 int setMicroTimer(int tick_microseconds = DEFAULT_TICK_MICROSECONDS) | use the microsecond timer provided by IntervalTimer & PIT; instead of 1 tick = 1 millisecond, 1 tick will be the number of microseconds provided (default is 100 microseconds)
 **Power saving** |
-void idle() | called in main loop to execute sleep, etc.
-void sleep(int ms) | suspend CPU for ms milliseconds. Must call `setSleepCallback()` first.
+void idle() | optionally called in main loop to put the CPU to sleep (via the sleep callback) until the next sleeping thread is due
+void sleep(int ms) | suspend the current thread for ms milliseconds; it is woken automatically by the scheduler
 void setSleepCallback(int (*)(int)) | Set sleep callback function that puts CPU to sleep
 
 
@@ -322,7 +322,6 @@ Todo
 -----------------------------
 
 - Optimize assembler and other switching code.
-- Support unlimited threads.
 - Check for stack overflow during context_change() to aid in debugging;
 or have a stack that grows automatically if it gets close filling.
 - Fully implement the new C++11 std::thread or POSIX threads.

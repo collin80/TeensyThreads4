@@ -152,10 +152,13 @@ class ThreadInfo {
     volatile int flags = 0;
     void *sp;
     int ticks;
-    volatile int sleep_time_till_end_tick; // Per-task sleep time
+    volatile uint32_t wake_time = 0;     // millis() value at which a SLEEPING thread wakes
     unsigned long cyclesAccum = 0;       // total CPU cycles used (wraps around)
     uint32_t cyclesWindow = 0;           // cycles used in the current CPU usage window
     uint32_t cyclesLastWindow = 0;       // cycles used in the last completed CPU usage window
+    int id = 0;                          // thread id returned by addThread()
+    volatile uint32_t generation = 0;    // incremented each time addThread() (re)uses this node
+    ThreadInfo *next = NULL;             // next thread in the list (NULL at end)
 };
 
 extern "C" void unused_isr(void);
@@ -173,11 +176,8 @@ typedef void (*IsrFunction)();
  */
 class Threads {
 public:
-  // The maximum number of threads is hard-coded to simplify
-  // the implementation. See notes of ThreadInfo.
   int DEFAULT_TICKS = 10;
   int DEFAULT_STACK_SIZE = 1024;
-  static const int MAX_THREADS = 16;
   static const int DEFAULT_STACK0_SIZE = 10240; // estimate for thread 0?
   static const int DEFAULT_TICK_MICROSECONDS = 100;
   static const int UTIL_STATE_NAME_DESCRIPTION_LENGTH = 24;
@@ -197,6 +197,7 @@ public:
   static const int ENDED = 2;
   static const int ENDING = 3;
   static const int SUSPENDED = 4;
+  static const int SLEEPING = 5;
 
   static const int SVC_NUMBER = 0x21;
   static const int SVC_NUMBER_ACTIVE = 0x22;
@@ -207,16 +208,13 @@ protected:
   int thread_error;
 
   /*
-   * The maximum number of threads is hard-coded. Alternatively, we could implement
-   * a linked list which would mean using up less memory for a small number of
-   * threads while allowing an unlimited number of possible threads. This would
-   * probably not slow down thread switching too much, but it would introduce
-   * complexity and possibly bugs. So to simplifiy for now, we use an array.
-   * But in the future, a linked list might be more appropriate.
+   * Singly linked list of all threads, ordered by id. The head is always
+   * thread 0 (the main MSP thread). Nodes are never freed; a thread that has
+   * ENDED keeps its node (and id) so it can be reused by a later addThread().
+   * New nodes are only appended to the tail, so the context switcher can
+   * safely walk the list at any time.
    */
-  ThreadInfo *threadp[MAX_THREADS];
-  // This used to be allocated statically, as below. Kept for reference in case of bugs.
-  // ThreadInfo thread[MAX_THREADS];
+  ThreadInfo *threadp;
 
   ThreadFunctionSleep enter_sleep_callback = NULL;
 
@@ -249,12 +247,15 @@ public:
   int getState(int id);
   // Explicityly set a state. See getState(). Call with care.
   int setState(int id, int state);
-  // Wait until thread returns up to timeout_ms milliseconds. If ms is 0, wait
-  // indefinitely.
+  // Wait until thread ends (returns or is killed), up to timeout_ms milliseconds.
+  // If ms is 0, wait indefinitely. Returns id, or -1 on timeout or if called
+  // with the current thread's own id.
   int wait(int id, unsigned int timeout_ms = 0);
-  // If using sleep, please run this in infinite loop
+  // Put the CPU to sleep (via the sleep callback) until the next sleeping
+  // thread is due to wake. Optional; call repeatedly from the main loop.
   void idle();
-  // Suspend execution of current thread for ms milliseconds
+  // Suspend execution of current thread for ms milliseconds. The thread
+  // is woken automatically by the scheduler; no sleep callback is needed.
   void sleep(int ms);
   // Permanently stop a running thread. Thread will end on the next thread slice tick.
   int kill(int id);
@@ -317,6 +318,7 @@ public:
 
 protected:
   void getNextThread();
+  ThreadInfo *getThreadInfo(int id);
   void *loadstack(ThreadFunction p, void * arg, void *stackaddr, int stack_size);
   static void force_switch_isr();
   void setStackMarker(void *stack);

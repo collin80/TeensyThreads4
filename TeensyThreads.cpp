@@ -25,6 +25,7 @@
 #include "TeensyThreads.h"
 #include <Arduino.h>
 #include <string.h>
+#include <new>
 
 Threads threads;
 
@@ -197,6 +198,9 @@ char * _util_state_2_string(int state){
     case 4:
         sprintf(_state, "SUSPENDED");
         break;
+    case 5:
+        sprintf(_state, "SLEEPING");
+        break;
     default:
         sprintf(_state, "%d", state);
         break;
@@ -209,28 +213,26 @@ char * _util_state_2_string(int state){
 /**\name CLASS THREAD                            */
 /*************************************************/
 Threads::Threads() : current_thread(0), thread_count(0), thread_error(0) {
-  // initilize thread slots to empty
-  for(int i=1; i<MAX_THREADS; i++) {
-    threadp[i] = NULL;
-  }
-  // fill thread 0, which is always running
-  threadp[0] = new ThreadInfo();
+  // thread 0 is the head of the list and is always running
+  threadp = new ThreadInfo();
+  threadp->id = 0;
+  threadp->next = NULL;
 
   // initialize context_switch() globals from thread 0, which is MSP and always running
-  currentThread = threadp[0];        // thread 0 is active
-  currentSave = &threadp[0]->save;
+  currentThread = threadp;        // thread 0 is active
+  currentSave = &threadp->save;
   currentMSP = 1;
   currentSP = 0;
   currentCount = Threads::DEFAULT_TICKS;
   currentActive = FIRST_RUN;
-  threadp[0]->flags = RUNNING;
-  threadp[0]->ticks = DEFAULT_TICKS;
+  threadp->flags = RUNNING;
+  threadp->ticks = DEFAULT_TICKS;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Warray-bounds"
-  threadp[0]->stack = (uint8_t*)&_estack - DEFAULT_STACK0_SIZE;
+  threadp->stack = (uint8_t*)&_estack - DEFAULT_STACK0_SIZE;
 #pragma GCC diagnostic pop
-  threadp[0]->stack_size = DEFAULT_STACK0_SIZE;
-  setStackMarker(threadp[0]->stack);
+  threadp->stack_size = DEFAULT_STACK0_SIZE;
+  setStackMarker(threadp->stack);
 
   cpu_switch_start = ARM_DWT_CYCCNT;
   cpu_window_start = cpu_switch_start;
@@ -289,10 +291,9 @@ void Threads::getNextThread() {
   // getCPUUsage() can report a consistent snapshot
   uint32_t window_length = now - cpu_window_start;
   if (window_length >= cpu_window_ms * (F_CPU_ACTUAL / 1000)) {
-    for (int i=0; i < MAX_THREADS; i++) {
-      if (threadp[i] == NULL) continue;
-      threadp[i]->cyclesLastWindow = threadp[i]->cyclesWindow;
-      threadp[i]->cyclesWindow = 0;
+    for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next) {
+      tp->cyclesLastWindow = tp->cyclesWindow;
+      tp->cyclesWindow = 0;
     }
     cpu_last_window_cycles = window_length;
     cpu_window_start = now;
@@ -307,21 +308,40 @@ void Threads::getNextThread() {
     stack_overflow_isr();
   }
 
-  // Find the next running thread
-  while(1) {
-    current_thread++;
-    if (current_thread >= MAX_THREADS) {
-      current_thread = 0; // thread 0 is MSP; always active so return
-      break;
+  // Find the next running thread, waking any sleeping thread whose time is up.
+  // Threads before the current one are checked on the next pass of the list.
+  uint32_t now_ms = millis();
+  ThreadInfo *tp = currentThread->next;
+  while (tp != NULL) {
+    if (tp->flags == SLEEPING && (int32_t)(now_ms - tp->wake_time) >= 0) {
+      tp->flags = RUNNING;
     }
-    if (threadp[current_thread] && threadp[current_thread]->flags == RUNNING) break;
+    if (tp->flags == RUNNING) break;
+    tp = tp->next;
   }
-  currentCount = threadp[current_thread]->ticks;
+  if (tp == NULL) tp = threadp; // end of list; thread 0 is MSP and always active
 
-  currentThread = threadp[current_thread];
-  currentSave = &threadp[current_thread]->save;
-  currentMSP = (current_thread==0?1:0);
-  currentSP = threadp[current_thread]->sp;
+  current_thread = tp->id;
+  currentCount = tp->ticks;
+
+  currentThread = tp;
+  currentSave = &tp->save;
+  currentMSP = (tp == threadp ? 1 : 0);
+  currentSP = tp->sp;
+}
+
+/*
+ * getThreadInfo() - Find the thread with the given id
+ *
+ * Returns NULL if no such thread exists.
+ */
+ThreadInfo *Threads::getThreadInfo(int id) {
+  if (id < 0) return NULL;
+  for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next) {
+    if (tp->id == id) return tp;
+    if (tp->id > id) break; // list is ordered by id
+  }
+  return NULL;
 }
 
 /*
@@ -377,7 +397,7 @@ int Threads::setSliceMillis(int milliseconds)
 void Threads::del_process(void)
 {
   int old_state = threads.stop();
-  ThreadInfo *me = threads.threadp[threads.current_thread];
+  ThreadInfo *me = currentThread;
   // Would love to delete stack here but the thread doesn't
   // end now. It continues until the next tick.
   // if (me->my_stack) {
@@ -410,12 +430,11 @@ void Threads::setStackMarker(void *stack)
  */
 int Threads::testStackMarkers(int *threadid)
 {
-  for (int i=0; i < MAX_THREADS; i++) {
-    if (threadp[i] == NULL) continue;
-    if (threadp[i]->flags == RUNNING) {
-      uint32_t *m = (uint32_t*)threadp[i]->stack;
+  for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next) {
+    if (tp->flags == RUNNING) {
+      uint32_t *m = (uint32_t*)tp->stack;
       if (*m != thread_marker) {
-        if (threadid) *threadid = i;
+        if (threadid) *threadid = tp->id;
         return -1;
       }
     }
@@ -463,66 +482,101 @@ int Threads::addThread(ThreadFunction p, void * arg, int stack_size, void *stack
 {
   int old_state = stop();
   if (stack_size == -1) stack_size = DEFAULT_STACK_SIZE;
-  for (int i=1; i < MAX_THREADS; i++) {
-    if (threadp[i] == NULL) { // empty thread, so fill it
-      threadp[i] = new ThreadInfo();
-    }
-    if (threadp[i]->flags == ENDED || threadp[i]->flags == EMPTY) { // free thread
-      ThreadInfo *tp = threadp[i]; // working on this thread
-      if (tp->stack && tp->my_stack) {
-        delete[] tp->stack;
-      }
-      if (stack==0) {
-        stack = new uint8_t[stack_size];
-        tp->my_stack = 1;
-      }
-      else {
-        tp->my_stack = 0;
-      }
-      setStackMarker(stack);
-      tp->stack = (uint8_t*)stack;
-      tp->stack_size = stack_size;
-      void *psp = loadstack(p, arg, tp->stack, tp->stack_size);
-      tp->sp = psp;
-      tp->ticks = DEFAULT_TICKS;
-      tp->flags = RUNNING;
-      tp->save.lr = 0xFFFFFFF9;
 
-      tp->cyclesAccum = 0;
-      tp->cyclesWindow = 0;
-      tp->cyclesLastWindow = 0;
-
-      currentActive = old_state;
-      thread_count++;
-      if (old_state == STARTED || old_state == FIRST_RUN) start();
-      return i;
+  // Reuse a thread that has ended, if any; otherwise append a new one
+  ThreadInfo *tp = NULL;
+  ThreadInfo *last = threadp;
+  for (ThreadInfo *t = threadp->next; t != NULL; t = t->next) {
+    if (t->flags == ENDED || t->flags == EMPTY) {
+      tp = t;
+      break;
     }
+    last = t;
   }
-  if (old_state == STARTED) start();
-  return -1;
+  bool is_new = (tp == NULL);
+  if (is_new) {
+    tp = new (std::nothrow) ThreadInfo();
+    if (tp == NULL) {
+      if (old_state == STARTED) start();
+      return -1;
+    }
+    tp->id = last->id + 1;
+    tp->next = NULL;
+  }
+
+  if (tp->stack && tp->my_stack) {
+    delete[] tp->stack;
+    tp->stack = 0;
+  }
+  if (stack==0) {
+    stack = new (std::nothrow) uint8_t[stack_size];
+    if (stack == 0) {
+      if (is_new) delete tp;
+      else tp->flags = ENDED;
+      if (old_state == STARTED) start();
+      return -1;
+    }
+    tp->my_stack = 1;
+  }
+  else {
+    tp->my_stack = 0;
+  }
+  setStackMarker(stack);
+  tp->stack = (uint8_t*)stack;
+  tp->stack_size = stack_size;
+  void *psp = loadstack(p, arg, tp->stack, tp->stack_size);
+  tp->sp = psp;
+  tp->ticks = DEFAULT_TICKS;
+  tp->save.lr = 0xFFFFFFF9;
+
+  tp->cyclesAccum = 0;
+  tp->cyclesWindow = 0;
+  tp->cyclesLastWindow = 0;
+  tp->generation++; // lets wait() tell this thread apart from an earlier one with the same id
+  tp->flags = RUNNING;
+
+  // Link in only once fully initialized
+  if (is_new) last->next = tp;
+
+  currentActive = old_state;
+  thread_count++;
+  if (old_state == STARTED || old_state == FIRST_RUN) start();
+  return tp->id;
 }
 
 int Threads::getState(int id)
 {
-  return threadp[id]->flags;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return EMPTY;
+  return tp->flags;
 }
 
 int Threads::setState(int id, int state)
 {
-  threadp[id]->flags = state;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return -1;
+  tp->flags = state;
   return state;
 }
 
 int Threads::wait(int id, unsigned int timeout_ms)
 {
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return id;
+  if (tp == currentThread) return -1; // a thread can never see itself end
+  // If the thread ends and its id is reused by addThread() before we look
+  // again, the generation changes even though flags may read RUNNING.
+  uint32_t generation = tp->generation;
   unsigned int start = millis();
   // need to store state in temp volatile memory for optimizer.
-  // "while (thread[id].flags != RUNNING)" will be optimized away
+  // "while (thread[id].flags != ENDED)" will be optimized away
   volatile int state;
   while (1) {
     if (timeout_ms != 0 && millis() - start > timeout_ms) return -1;
-    state = threadp[id]->flags;
-    if (state != RUNNING) break;
+    state = tp->flags;
+    if (tp->generation != generation) break;
+    // SUSPENDED and SLEEPING threads have not ended, so keep waiting
+    if (state == ENDED || state == EMPTY) break;
     yield();
   }
   return id;
@@ -530,25 +584,33 @@ int Threads::wait(int id, unsigned int timeout_ms)
 
 int Threads::kill(int id)
 {
-  threadp[id]->flags = ENDED;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return -1;
+  tp->flags = ENDED;
   return id;
 }
 
 int Threads::suspend(int id)
 {
-  threadp[id]->flags = SUSPENDED;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return -1;
+  tp->flags = SUSPENDED;
   return id;
 }
 
 int Threads::restart(int id)
 {
-  threadp[id]->flags = RUNNING;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return -1;
+  tp->flags = RUNNING;
   return id;
 }
 
 void Threads::setTimeSlice(int id, unsigned int ticks)
 {
-  threadp[id]->ticks = ticks - 1;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return;
+  tp->ticks = ticks - 1;
 }
 
 void Threads::setDefaultTimeSlice(unsigned int ticks)
@@ -589,71 +651,61 @@ void Threads::delay_us(int microsecond){
 }
 
 void Threads::idle() {
-	volatile bool needs_run[thread_count];
-	volatile int i, j;
-	volatile int task_id_ends;
-
   if (enter_sleep_callback==NULL) return;
 
-	__disable_irq();
-	task_id_ends = -1;
-	//get lowest sleep interval from sleeping tasks into task_id_ends
-	for (i = 0; i < thread_count; i++) {
-		//sort by ending time first
-		for (j = i + 1; j < thread_count; ++j) {
-			if (! threadp[i]) { continue; }
-			if (threadp[i]->sleep_time_till_end_tick > threadp[j]->sleep_time_till_end_tick) {
-				//if end time soonest
-				if (getState(i+1) == SUSPENDED) {
-					task_id_ends = j; //store next task
-				}
-			}
-		}
-	}
-  if (task_id_ends==-1) return;
+  __disable_irq();
+  // find the soonest wake-up time among sleeping threads
+  uint32_t now = millis();
+  bool any_sleeping = false;
+  int32_t sleep_ms = 0;
+  for (ThreadInfo *tp = threadp->next; tp != NULL; tp = tp->next) {
+    if (tp->flags != SLEEPING) continue;
+    int32_t remaining = (int32_t)(tp->wake_time - now);
+    if (!any_sleeping || remaining < sleep_ms) sleep_ms = remaining;
+    any_sleeping = true;
+  }
 
-	//set the sleeping time to substractor
-	int subtractor = threadp[task_id_ends]->sleep_time_till_end_tick;
-	
-	if (subtractor > 0) {
-		//if sleep is needed
-		volatile int time_spent_asleep = enter_sleep_callback(subtractor);
-		//store new data based on time spent asleep
-		for (i = 0; i < thread_count; i++) {
-      if (! threadp[i]) continue;
-      needs_run[i] = 0;
-      if (getState(i+1) == SUSPENDED) {
-				threadp[i]->sleep_time_till_end_tick -= time_spent_asleep; //substract sleep time
-				//time to run?
-				if (threadp[i]->sleep_time_till_end_tick <= 0) {
-					needs_run[i] = 1;
-				} else {
-					needs_run[i] = 0;
-				}
-			}
-		}
-		//for each thread when slept, resume if needed
-		for (i = 0; i < thread_count; i++) {
-			if (! threadp[i]) { continue; }
-			if (needs_run[i]) {
-				setState(i+1, RUNNING);
-				threadp[i]->sleep_time_till_end_tick = 60000;
-			}
-		}
-	}
-	__enable_irq();
-	yield();
+  if (any_sleeping && sleep_ms > 0) {
+    int time_spent_asleep = enter_sleep_callback(sleep_ms);
+    // Deep sleep modes stop the systick, so millis() may not have advanced
+    // while asleep. Pull wake times earlier by whatever millis() missed.
+    int32_t missed = time_spent_asleep - (int32_t)(millis() - now);
+    if (missed > 0) {
+      for (ThreadInfo *tp = threadp->next; tp != NULL; tp = tp->next) {
+        if (tp->flags == SLEEPING) tp->wake_time -= missed;
+      }
+    }
+  }
+  __enable_irq();
+  yield(); // the scheduler wakes any thread whose time is up
 }
 
 void Threads::sleep(int ms) {
-	int i = id();
-	if (getState(i) == RUNNING) {
-		__disable_irq();
-		threadp[i-1]->sleep_time_till_end_tick = ms;
-		setState(i, SUSPENDED);
-		__enable_irq();
-		yield();
-	}
+  ThreadInfo *tp = currentThread;
+  if (ms <= 0) {
+    yield();
+    return;
+  }
+  __disable_irq();
+  if (tp->flags != RUNNING) {
+    __enable_irq();
+    return;
+  }
+  tp->wake_time = millis() + ms;
+  tp->flags = SLEEPING;
+  __enable_irq();
+
+  // getNextThread() wakes the thread when its time is up; until then it is
+  // not scheduled. Thread 0 is always scheduled, and yield() returns at once
+  // if threading is stopped, so also check the time here.
+  while (tp->flags == SLEEPING) {
+    __disable_irq();
+    if (tp->flags == SLEEPING && (int32_t)(millis() - tp->wake_time) >= 0) {
+      tp->flags = RUNNING;
+    }
+    __enable_irq();
+    if (tp->flags == SLEEPING) yield();
+  }
 }
 
 /* End of experimental code */
@@ -667,11 +719,15 @@ int Threads::id() {
 }
 
 int Threads::getStackUsed(int id) {
-  return threadp[id]->stack + threadp[id]->stack_size - (uint8_t*)threadp[id]->sp;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return 0;
+  return tp->stack + tp->stack_size - (uint8_t*)tp->sp;
 }
 
 int Threads::getStackRemaining(int id) {
-  return (uint8_t*)threadp[id]->sp - threadp[id]->stack;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return 0;
+  return (uint8_t*)tp->sp - tp->stack;
 }
 
 char *Threads::threadsInfo(void)
@@ -679,40 +735,41 @@ char *Threads::threadsInfo(void)
   static char _buffer[Threads::UTIL_TRHEADS_BUFFER_LENGTH];
   unsigned int _buffer_cursor = 0;
   _buffer_cursor = sprintf(_buffer, "_____\n");
-  for (int each_thread = 0; each_thread < thread_count; each_thread++)
+  for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next)
   {
-    if (threadp[each_thread] != NULL)
-    {
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "%d:", each_thread);
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "Stack size:%d|",
-                                threadp[each_thread]->stack_size);
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "Used:%d|Remains:%d|",
-                                getStackUsed(each_thread),
-                                getStackRemaining(each_thread));
-      char *_thread_state = _util_state_2_string(threadp[each_thread]->flags);
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "State:%s|",
-                                _thread_state);
-      int cpu_tenths = (int)(getCPUUsage(each_thread) * 10.0f + 0.5f);
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "CPU:%d.%d%%|cycles:%lu\n",
-                                cpu_tenths / 10, cpu_tenths % 10,
-                                threadp[each_thread]->cyclesAccum);
-    }
+    // each line is well under 160 bytes; stop before overflowing the buffer
+    if (_buffer_cursor + 160 > sizeof(_buffer)) break;
+    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "%d:", tp->id);
+    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "Stack size:%d|",
+                              tp->stack_size);
+    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "Used:%d|Remains:%d|",
+                              getStackUsed(tp->id),
+                              getStackRemaining(tp->id));
+    char *_thread_state = _util_state_2_string(tp->flags);
+    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "State:%s|",
+                              _thread_state);
+    int cpu_tenths = (int)(getCPUUsage(tp->id) * 10.0f + 0.5f);
+    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "CPU:%d.%d%%|cycles:%lu\n",
+                              cpu_tenths / 10, cpu_tenths % 10,
+                              tp->cyclesAccum);
   }
   return _buffer;
 }
 
 unsigned long Threads::getCyclesUsed(int id) {
-  if (id < 0 || id >= MAX_THREADS || threadp[id] == NULL) return 0;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return 0;
   __disable_irq();
-  unsigned long ret = threadp[id]->cyclesAccum;
+  unsigned long ret = tp->cyclesAccum;
   __enable_irq();
   return ret;
 }
 
 float Threads::getCPUUsage(int id) {
-  if (id < 0 || id >= MAX_THREADS || threadp[id] == NULL) return 0.0f;
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return 0.0f;
   __disable_irq();
-  uint32_t used = threadp[id]->cyclesLastWindow;
+  uint32_t used = tp->cyclesLastWindow;
   uint32_t total = cpu_last_window_cycles;
   __enable_irq();
   if (total == 0) return 0.0f; // no window completed yet
