@@ -65,6 +65,37 @@ IsrFunction Threads::save_systick_isr;
 IsrFunction Threads::save_svcall_isr;
 
 /*
+ * Handle the SVC instruction used by yield(). Note that this function is
+ * "naked" meaning it does not save it's registers on the stack. This is so
+ * we can preserve the stack of the caller.
+ */
+void __attribute((naked, noinline)) threads_svcall_isr(void)
+{
+  if (Threads::save_svcall_isr) {
+    asm volatile("push {r0-r4,lr}");
+    (*Threads::save_svcall_isr)();
+    asm volatile("pop {r0-r4,lr}");
+  }
+
+  // Get the right stack so we can extract the PC (next instruction)
+  // and then see the SVC calling instruction number
+  __asm volatile("TST lr, #4 \n"
+                 "ITE EQ \n"
+                 "MRSEQ r0, msp \n"
+                 "MRSNE r0, psp \n");
+  register unsigned int *rsp __asm("r0");
+  unsigned int svc = ((uint8_t*)rsp[6])[-2];
+  if (svc == Threads::SVC_NUMBER) {
+    __asm volatile("b context_switch_direct");
+  }
+  else if (svc == Threads::SVC_NUMBER_ACTIVE) {
+    currentActive = Threads::STARTED;
+    __asm volatile("b context_switch_direct_active");
+  }
+  __asm volatile("bx lr");
+}
+
+/*
  * 
  * Teensy 4:
  * Use unused GPT timers for context switching
@@ -201,6 +232,9 @@ Threads::Threads() : current_thread(0), thread_count(0), thread_error(0) {
   threadp[0]->stack_size = DEFAULT_STACK0_SIZE;
   setStackMarker(threadp[0]->stack);
 
+  cpu_switch_start = ARM_DWT_CYCCNT;
+  cpu_window_start = cpu_switch_start;
+
   // commandeer SVCall & use GTP1 Interrupt
   save_svcall_isr = _VectorsRam[11];
   if (save_svcall_isr == unused_interrupt_vector) save_svcall_isr = 0;
@@ -243,11 +277,26 @@ int Threads::stop() {
  */
 void Threads::getNextThread() {
 
-#ifdef DEBUG
   // Keep track of the number of cycles expended by each thread.
   // See @dfragster: https://forum.pjrc.com/threads/41504-Teensy-3-x-multithreading-library-first-release?p=213086#post213086
-  currentThread->cyclesAccum += ARM_DWT_CYCCNT - currentThread->cyclesStart;
-#endif
+  uint32_t now = ARM_DWT_CYCCNT;
+  uint32_t elapsed = now - cpu_switch_start;
+  currentThread->cyclesAccum += elapsed;
+  currentThread->cyclesWindow += elapsed;
+  cpu_switch_start = now;
+
+  // At the end of each window, latch every thread's cycle count so
+  // getCPUUsage() can report a consistent snapshot
+  uint32_t window_length = now - cpu_window_start;
+  if (window_length >= cpu_window_ms * (F_CPU_ACTUAL / 1000)) {
+    for (int i=0; i < MAX_THREADS; i++) {
+      if (threadp[i] == NULL) continue;
+      threadp[i]->cyclesLastWindow = threadp[i]->cyclesWindow;
+      threadp[i]->cyclesWindow = 0;
+    }
+    cpu_last_window_cycles = window_length;
+    cpu_window_start = now;
+  }
 
   // First, save the currentSP set by context_switch
   currentThread->sp = currentSP;
@@ -273,10 +322,6 @@ void Threads::getNextThread() {
   currentSave = &threadp[current_thread]->save;
   currentMSP = (current_thread==0?1:0);
   currentSP = threadp[current_thread]->sp;
-
-#ifdef DEBUG
-  currentThread->cyclesStart = ARM_DWT_CYCCNT;
-#endif
 }
 
 /*
@@ -443,10 +488,9 @@ int Threads::addThread(ThreadFunction p, void * arg, int stack_size, void *stack
       tp->flags = RUNNING;
       tp->save.lr = 0xFFFFFFF9;
 
-#ifdef DEBUG
-      tp->cyclesStart = ARM_DWT_CYCCNT;
       tp->cyclesAccum = 0;
-#endif
+      tp->cyclesWindow = 0;
+      tp->cyclesLastWindow = 0;
 
       currentActive = old_state;
       thread_count++;
@@ -648,25 +692,40 @@ char *Threads::threadsInfo(void)
       char *_thread_state = _util_state_2_string(threadp[each_thread]->flags);
       _buffer_cursor += sprintf(_buffer + _buffer_cursor, "State:%s|",
                                 _thread_state);
-#ifdef DEBUG
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "cycles:%lu\n",
+      int cpu_tenths = (int)(getCPUUsage(each_thread) * 10.0f + 0.5f);
+      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "CPU:%d.%d%%|cycles:%lu\n",
+                                cpu_tenths / 10, cpu_tenths % 10,
                                 threadp[each_thread]->cyclesAccum);
-#else
-      _buffer_cursor += sprintf(_buffer + _buffer_cursor, "\n");
-#endif
     }
   }
   return _buffer;
 }
 
-#ifdef DEBUG
 unsigned long Threads::getCyclesUsed(int id) {
-  stop();
+  if (id < 0 || id >= MAX_THREADS || threadp[id] == NULL) return 0;
+  __disable_irq();
   unsigned long ret = threadp[id]->cyclesAccum;
-  start();
+  __enable_irq();
   return ret;
 }
-#endif
+
+float Threads::getCPUUsage(int id) {
+  if (id < 0 || id >= MAX_THREADS || threadp[id] == NULL) return 0.0f;
+  __disable_irq();
+  uint32_t used = threadp[id]->cyclesLastWindow;
+  uint32_t total = cpu_last_window_cycles;
+  __enable_irq();
+  if (total == 0) return 0.0f; // no window completed yet
+  return used * 100.0f / total;
+}
+
+void Threads::setCPUUsageWindow(unsigned int ms) {
+  if (ms == 0) ms = 1;
+  if (ms > MAX_CPU_WINDOW_MS) ms = MAX_CPU_WINDOW_MS;
+  __disable_irq();
+  cpu_window_ms = ms;
+  __enable_irq();
+}
 
 /*
  * On creation, stop threading and save state

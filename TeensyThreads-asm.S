@@ -65,6 +65,20 @@
   .align  2
   .thumb
 
+  .global context_switch_direct
+  .thumb_func
+context_switch_direct:
+  CPSID I
+  // Call here to force a context switch, so we skip checking the tick counter.
+  B call_direct
+
+  .global context_switch_direct_active
+  .thumb_func
+context_switch_direct_active:
+  CPSID I
+  // Call here to force a context switch, so we skip checking the tick counter.
+  B call_direct_active
+
   .global context_switch
   .thumb_func
 context_switch:

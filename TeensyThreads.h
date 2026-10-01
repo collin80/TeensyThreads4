@@ -72,15 +72,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Enabling debugging information allows access to:
- *   getCyclesUsed()
- */
-// #define DEBUG
-
 extern "C" {
   void context_switch(void);
   void context_switch_direct(void);
-  void context_switch_pit_isr(void);
+  void context_switch_direct_active(void);
   void loadNextThread();
   void stack_overflow_isr(void);
   void threads_svcall_isr(void);
@@ -158,10 +153,9 @@ class ThreadInfo {
     void *sp;
     int ticks;
     volatile int sleep_time_till_end_tick; // Per-task sleep time
-#ifdef DEBUG
-    unsigned long cyclesStart;  // On T_4 the CycCnt is always active - on T_3.x it currently is not - unless Audio starts it AFAIK
-    unsigned long cyclesAccum;
-#endif
+    unsigned long cyclesAccum = 0;       // total CPU cycles used (wraps around)
+    uint32_t cyclesWindow = 0;           // cycles used in the current CPU usage window
+    uint32_t cyclesLastWindow = 0;       // cycles used in the last completed CPU usage window
 };
 
 extern "C" void unused_isr(void);
@@ -188,6 +182,8 @@ public:
   static const int DEFAULT_TICK_MICROSECONDS = 100;
   static const int UTIL_STATE_NAME_DESCRIPTION_LENGTH = 24;
   static const int UTIL_TRHEADS_BUFFER_LENGTH = 1024;
+  static const int DEFAULT_CPU_WINDOW_MS = 1000;
+  static const int MAX_CPU_WINDOW_MS = 4000; // window in cycles must fit in 32 bits
 
 
   // State of threading system
@@ -223,6 +219,12 @@ protected:
   // ThreadInfo thread[MAX_THREADS];
 
   ThreadFunctionSleep enter_sleep_callback = NULL;
+
+  // CPU usage accounting, updated on every context switch
+  uint32_t cpu_switch_start = 0;        // cycle count when current thread was switched in
+  uint32_t cpu_window_start = 0;        // cycle count when the current window began
+  uint32_t cpu_last_window_cycles = 0;  // length of the last completed window in cycles
+  uint32_t cpu_window_ms = DEFAULT_CPU_WINDOW_MS;
 
 public: // public for debugging
   static IsrFunction save_systick_isr;
@@ -281,9 +283,13 @@ public:
   int getStackUsed(int id);
   int getStackRemaining(int id);
   char* threadsInfo(void);
-#ifdef DEBUG
+  // Total CPU cycles used by a thread since it was created (wraps around)
   unsigned long getCyclesUsed(int id);
-#endif
+  // Percentage of CPU time (0-100) used by a thread during the last completed
+  // measurement window. Time spent in interrupts is charged to the interrupted thread.
+  float getCPUUsage(int id);
+  // Set the CPU usage measurement window in milliseconds (default 1000, max 4000)
+  void setCPUUsageWindow(unsigned int ms);
 
   // Yield current thread's remaining time slice to the next thread, causing immediate
   // context switch
@@ -305,7 +311,6 @@ public:
   // Allow these static functions and classes to access our members
   friend void context_switch(void);
   friend void context_switch_direct(void);
-  friend void threads_systick_isr(void);
   friend void threads_svcall_isr(void);
   friend void loadNextThread();
   friend class ThreadLock;

@@ -100,6 +100,10 @@ void yield() | Yield current thread's remaining time slice to the next thread, c
 void delay(int millisecond) | Wait for milliseconds using yield(), giving other slices your wait time
 int start(int new_state = -1) | Start/restart threading system; returns previous state. Optionally pass STARTED, STOPPED, FIRST_RUN to restore a different state.
 int stop() | Stop threading system; returns previous state: STARTED, STOPPED, FIRST_RUN
+**CPU usage** |
+float getCPUUsage(int id) | Percentage of CPU time (0-100) used by a thread during the last completed measurement window. Interrupt time is charged to the interrupted thread.
+void setCPUUsageWindow(unsigned int ms) | Set the CPU usage measurement window in milliseconds (default 1000, max 4000)
+unsigned long getCyclesUsed(int id) | Total CPU cycles used by a thread since it was created (wraps around)
 **Advanced functions** |
 void setDefaultStackSize(unsigned int bytes_size) | Set the stack size for new threads in bytes
 void setTimeSlice(int id, unsigned int ticks) | Set the slice length time in ticks for a thread (1 tick = 1 millisecond, unless using MicroTimer)
