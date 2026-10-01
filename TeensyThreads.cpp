@@ -26,13 +26,6 @@
 #include <Arduino.h>
 #include <string.h>
 
-#ifndef __IMXRT1062__
-
-#include <IntervalTimer.h>
-IntervalTimer context_timer;
-
-#endif
-
 Threads threads;
 
 unsigned int time_start;
@@ -70,62 +63,6 @@ extern unsigned long _estack;   // the main thread 0 stack
 
 IsrFunction Threads::save_systick_isr;
 IsrFunction Threads::save_svcall_isr;
-
-/*
- * Teensy 3:
- * Replace the SysTick interrupt for our context switching. Note that
- * this function is "naked" meaning it does not save it's registers
- * on the stack. This is so we can preserve the stack of the caller.
- *
- * Interrupts will save r0-r4 in the stack and since this function
- * is short and simple, it should only use those registers. In the
- * future, this should be coded in assembly to make sure.
- */
-extern volatile uint32_t systick_millis_count;
-extern "C" void systick_isr();
-void __attribute((naked, noinline)) threads_systick_isr(void)
-{
-  if (Threads::save_systick_isr) {
-    asm volatile("push {r0-r4,lr}");
-    (*Threads::save_systick_isr)();
-    asm volatile("pop {r0-r4,lr}");
-  }
-
-  // TODO: Teensyduino 1.38 calls MillisTimer::runFromTimer() from SysTick
-  if (currentUseSystick) {
-    // we branch in order to preserve LR and the stack
-    __asm volatile("b context_switch");
-  }
-  __asm volatile("bx lr");
-}
-
-void __attribute((naked, noinline)) threads_svcall_isr(void)
-{
-  if (Threads::save_svcall_isr) {
-    asm volatile("push {r0-r4,lr}");
-    (*Threads::save_svcall_isr)();
-    asm volatile("pop {r0-r4,lr}");
-  }
-
-  // Get the right stack so we can extract the PC (next instruction)
-  // and then see the SVC calling instruction number
-  __asm volatile("TST lr, #4 \n"
-                 "ITE EQ \n"
-                 "MRSEQ r0, msp \n"
-                 "MRSNE r0, psp \n");
-  register unsigned int *rsp __asm("r0");
-  unsigned int svc = ((uint8_t*)rsp[6])[-2];
-  if (svc == Threads::SVC_NUMBER) {
-    __asm volatile("b context_switch_direct");
-  }
-  else if (svc == Threads::SVC_NUMBER_ACTIVE) {
-    currentActive = Threads::STARTED;
-    __asm volatile("b context_switch_direct_active");
-  }
-  __asm volatile("bx lr");
-}
-
-#ifdef __IMXRT1062__
 
 /*
  * 
@@ -202,8 +139,6 @@ bool gtp1_init(unsigned int microseconds)
   return true;
 }
 
-#endif
-
 /*************************************************/
 /**\name UTILITIES FUNCTIONS                     */
 /*************************************************/
@@ -266,8 +201,6 @@ Threads::Threads() : current_thread(0), thread_count(0), thread_error(0) {
   threadp[0]->stack_size = DEFAULT_STACK0_SIZE;
   setStackMarker(threadp[0]->stack);
 
-#ifdef __IMXRT1062__
-
   // commandeer SVCall & use GTP1 Interrupt
   save_svcall_isr = _VectorsRam[11];
   if (save_svcall_isr == unused_interrupt_vector) save_svcall_isr = 0;
@@ -275,28 +208,6 @@ Threads::Threads() : current_thread(0), thread_count(0), thread_error(0) {
 
   currentUseSystick = 0; // disable Systick calls
   gtp1_init(1000);       // tick every millisecond
-
-#else
-
-  currentUseSystick = 1;
-
-  // commandeer the SVCall & SysTick Exceptions
-  save_svcall_isr = _VectorsRam[11];
-  if (save_svcall_isr == unused_isr) save_svcall_isr = 0;
-  _VectorsRam[11] = threads_svcall_isr;
-  
-  save_systick_isr = _VectorsRam[15];
-  if (save_systick_isr == unused_isr) save_systick_isr = 0;
-  _VectorsRam[15] = threads_systick_isr;
-
-#ifdef DEBUG
-#if defined(__MK20DX256__) || defined(__MK20DX128__)
-  ARM_DEMCR |= ARM_DEMCR_TRCENA; // Make ssure Cycle Counter active
-  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
-#endif
-#endif
-
-#endif
 }
 
 /*
@@ -369,20 +280,9 @@ void Threads::getNextThread() {
 }
 
 /*
- * Empty placeholder for IntervalTimer class
- */
-#ifndef __IMXRT1062__
-static void context_pit_empty() {}
-#endif
-/*
  * Store the PIT timer flag register for use in assembly
  */
 volatile uint32_t *context_timer_flag;
-
-/*
- * Defined in assembly code
- */
-extern "C" void context_switch_pit_isr();
 
 /*
  * Stop using the SysTick interrupt and start using
@@ -391,36 +291,7 @@ extern "C" void context_switch_pit_isr();
  */
 int Threads::setMicroTimer(int tick_microseconds)
 {
-#ifdef __IMXRT1062__
-
   gtp1_init(tick_microseconds);
-
-#else
-
-/*
- * Implementation strategy suggested by @tni in Teensy Forums; see
- * https://forum.pjrc.com/threads/41504-Teensy-3-x-multithreading-library-first-release
- */
-
-  // lowest priority so we don't interrupt other interrupts
-  context_timer.priority(255);
-  // start timer with dummy fuction
-  if (context_timer.begin(context_pit_empty, tick_microseconds) == 0) {
-    // failed to set the timer!
-    return 0;
-  }
-  currentUseSystick = 0; // disable Systick calls
-
-  // get the PIT number [0-3] (IntervalTimer overrides IRQ_NUMBER_t op)
-  int number = (IRQ_NUMBER_t)context_timer - IRQ_PIT_CH0;
-  // calculate number of uint32_t per PIT; should be 4.
-  // Not hard-coded in case this changes in future CPUs.
-  const int width = (PIT_TFLG1 - PIT_TFLG0) / sizeof(uint32_t);
-  // get the right flag to ackowledge PIT interrupt
-  context_timer_flag = &PIT_TFLG0 + (width * number);
-  attachInterruptVector(context_timer, context_switch_pit_isr);
-
-#endif
 
   return 1;
 }

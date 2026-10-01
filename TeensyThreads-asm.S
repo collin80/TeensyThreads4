@@ -65,30 +65,6 @@
   .align  2
   .thumb
 
-  .global context_switch_direct
-  .thumb_func
-context_switch_direct:
-  CPSID I
-  // Call here to force a context switch, so we skip checking the tick counter.
-  B call_direct
-
-  .global context_switch_direct_active
-  .thumb_func
-context_switch_direct_active:
-  CPSID I
-  // Call here to force a context switch, so we skip checking the tick counter.
-  B call_direct_active
-
-  .global context_switch_pit_isr
-  .thumb_func
-context_switch_pit_isr:
-  CPSID I
-  LDR r0, =context_timer_flag   // acknowledge the interrupt by
-  LDR r0, [r0]                  // getting the pointer to the pointer
-  MOVS r1, #1                   //
-  STR r1, [r0]                  // and setting to 1
-  B context_switch_check        // now go do the context switch
-
   .global context_switch
   .thumb_func
 context_switch:

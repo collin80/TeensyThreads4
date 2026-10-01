@@ -305,7 +305,6 @@ public:
   // Allow these static functions and classes to access our members
   friend void context_switch(void);
   friend void context_switch_direct(void);
-  friend void context_pit_isr(void);
   friend void threads_systick_isr(void);
   friend void threads_svcall_isr(void);
   friend void loadNextThread();
