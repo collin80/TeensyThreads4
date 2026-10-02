@@ -51,6 +51,7 @@ extern "C" {
 }
 
 const int overflow_stack_size = 8;
+const uint32_t thread_marker = 0xDEADDEAD;
 
 extern "C" void stack_overflow_default_isr() { 
   currentThread->flags = Threads::ENDED;
@@ -201,6 +202,9 @@ char * _util_state_2_string(int state){
     case 5:
         sprintf(_state, "SLEEPING");
         break;
+    case 6:
+        sprintf(_state, "BLOCKED");
+        break;
     default:
         sprintf(_state, "%d", state);
         break;
@@ -299,21 +303,36 @@ void Threads::getNextThread() {
     cpu_window_start = now;
   }
 
-  // First, save the currentSP set by context_switch
-  currentThread->sp = currentSP;
+  // First, save the currentSP set by context_switch. Thread 0 runs on MSP,
+  // which context_switch does not save, so read it directly (we are in an
+  // interrupt on the MSP, so this includes the exception frame).
+  if (currentThread == threadp) {
+    void *msp;
+    __asm volatile("mrs %0, msp" : "=r"(msp));
+    currentThread->sp = msp;
+  }
+  else {
+    currentThread->sp = currentSP;
+  }
 
-  // did we overflow the stack (don't check thread 0)?
+  // did we overflow the stack (don't check thread 0)? Either the stack pointer
+  // is at the bottom of the stack now, or the marker at the bottom of the stack
+  // has been overwritten since the last switch.
   // allow an extra 8 bytes for a call to the ISR and one additional call or variable
-  if (current_thread && ((uint8_t*)currentThread->sp - currentThread->stack <= overflow_stack_size)) {
+  if (current_thread && ((uint8_t*)currentThread->sp - currentThread->stack <= overflow_stack_size
+                         || *(uint32_t*)currentThread->stack != thread_marker)) {
     stack_overflow_isr();
   }
 
-  // Find the next running thread, waking any sleeping thread whose time is up.
-  // Threads before the current one are checked on the next pass of the list.
+  // Find the next running thread, waking any sleeping thread (or blocked
+  // thread with a timeout) whose time is up. Threads before the current one
+  // are checked on the next pass of the list.
   uint32_t now_ms = millis();
   ThreadInfo *tp = currentThread->next;
   while (tp != NULL) {
-    if (tp->flags == SLEEPING && (int32_t)(now_ms - tp->wake_time) >= 0) {
+    int flags = tp->flags;
+    if ((flags == SLEEPING || (flags == BLOCKED && tp->wait_timed))
+        && (int32_t)(now_ms - tp->wake_time) >= 0) {
       tp->flags = RUNNING;
     }
     if (tp->flags == RUNNING) break;
@@ -398,12 +417,8 @@ void Threads::del_process(void)
 {
   int old_state = threads.stop();
   ThreadInfo *me = currentThread;
-  // Would love to delete stack here but the thread doesn't
-  // end now. It continues until the next tick.
-  // if (me->my_stack) {
-  //   delete[] me->stack;
-  //   me->stack = 0;
-  // }
+  // The stack can't be freed here since we are still running on it. A stack
+  // the library allocated stays with this node and is reused by addThread().
   threads.thread_count--;
   me->flags = ENDED; //clear the flags so thread can stop and be reused
   threads.start(old_state);
@@ -413,8 +428,6 @@ void Threads::del_process(void)
 /*
  * Set a marker at memory so we can detect memory overruns
  */
-
-const uint32_t thread_marker = 0xDEADDEAD;
 
 void Threads::setStackMarker(void *stack)
 {
@@ -431,7 +444,7 @@ void Threads::setStackMarker(void *stack)
 int Threads::testStackMarkers(int *threadid)
 {
   for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next) {
-    if (tp->flags == RUNNING) {
+    if (tp->flags != ENDED && tp->flags != EMPTY) {
       uint32_t *m = (uint32_t*)tp->stack;
       if (*m != thread_marker) {
         if (threadid) *threadid = tp->id;
@@ -462,6 +475,25 @@ void *Threads::loadstack(ThreadFunction p, void * arg, void *stackaddr, int stac
 }
 
 /*
+ * Allocate a new ThreadInfo. If stack_size > 0, a stack of that size is
+ * allocated in the same block, with the ThreadInfo directly above it so a
+ * stack overflow runs away from the thread's own state.
+ * Returns NULL if out of memory.
+ */
+ThreadInfo *Threads::newThreadInfo(int stack_size)
+{
+  if (stack_size <= 0) return new (std::nothrow) ThreadInfo();
+  // keep the top of the stack, and so the ThreadInfo, 8 byte aligned
+  stack_size = (stack_size + 7) & ~7;
+  uint8_t *block = new (std::nothrow) uint8_t[stack_size + sizeof(ThreadInfo)];
+  if (block == NULL) return NULL;
+  ThreadInfo *tp = new (block + stack_size) ThreadInfo();
+  tp->block_stack = block;
+  tp->block_stack_size = stack_size;
+  return tp;
+}
+
+/*
  * Add a new thread to the queue.
  *    add_thread(fund, arg)
  *
@@ -482,20 +514,25 @@ int Threads::addThread(ThreadFunction p, void * arg, int stack_size, void *stack
 {
   int old_state = stop();
   if (stack_size == -1) stack_size = DEFAULT_STACK_SIZE;
+  if (stack == 0 && stack_size <= 0) stack_size = DEFAULT_STACK_SIZE;
 
-  // Reuse a thread that has ended, if any; otherwise append a new one
+  // Reuse a thread that has ended, if any; otherwise append a new one.
+  // Nodes are never freed, so their stacks are reused along with them; if the
+  // library is to allocate the stack, only reuse a node whose stack is big enough.
   ThreadInfo *tp = NULL;
   ThreadInfo *last = threadp;
   for (ThreadInfo *t = threadp->next; t != NULL; t = t->next) {
-    if (t->flags == ENDED || t->flags == EMPTY) {
+    if ((t->flags == ENDED || t->flags == EMPTY)
+        && (stack != 0 || t->block_stack_size >= stack_size)) {
       tp = t;
       break;
     }
     last = t;
   }
+  while (last->next != NULL) last = last->next;
   bool is_new = (tp == NULL);
   if (is_new) {
-    tp = new (std::nothrow) ThreadInfo();
+    tp = newThreadInfo(stack == 0 ? stack_size : 0);
     if (tp == NULL) {
       if (old_state == STARTED) start();
       return -1;
@@ -504,18 +541,10 @@ int Threads::addThread(ThreadFunction p, void * arg, int stack_size, void *stack
     tp->next = NULL;
   }
 
-  if (tp->stack && tp->my_stack) {
-    delete[] tp->stack;
-    tp->stack = 0;
-  }
   if (stack==0) {
-    stack = new (std::nothrow) uint8_t[stack_size];
-    if (stack == 0) {
-      if (is_new) delete tp;
-      else tp->flags = ENDED;
-      if (old_state == STARTED) start();
-      return -1;
-    }
+    // use all of the node's stack, which may be larger than requested
+    stack = tp->block_stack;
+    stack_size = tp->block_stack_size;
     tp->my_stack = 1;
   }
   else {
@@ -659,7 +688,7 @@ void Threads::idle() {
   bool any_sleeping = false;
   int32_t sleep_ms = 0;
   for (ThreadInfo *tp = threadp->next; tp != NULL; tp = tp->next) {
-    if (tp->flags != SLEEPING) continue;
+    if (tp->flags != SLEEPING && !(tp->flags == BLOCKED && tp->wait_timed)) continue;
     int32_t remaining = (int32_t)(tp->wake_time - now);
     if (!any_sleeping || remaining < sleep_ms) sleep_ms = remaining;
     any_sleeping = true;
@@ -672,7 +701,7 @@ void Threads::idle() {
     int32_t missed = time_spent_asleep - (int32_t)(millis() - now);
     if (missed > 0) {
       for (ThreadInfo *tp = threadp->next; tp != NULL; tp = tp->next) {
-        if (tp->flags == SLEEPING) tp->wake_time -= missed;
+        if (tp->flags == SLEEPING || tp->flags == BLOCKED) tp->wake_time -= missed;
       }
     }
   }
@@ -710,6 +739,60 @@ void Threads::sleep(int ms) {
 
 /* End of experimental code */
 
+/*
+ * block() - Mark the current thread BLOCKED waiting on obj
+ *
+ * Call with interrupts disabled, in the same critical section that found
+ * the thread must wait, so a wake() cannot be missed. Then re-enable
+ * interrupts and call waitWhileBlocked(). If timeout_ms is 0, the thread
+ * waits until woken.
+ */
+void Threads::block(const void *obj, unsigned int timeout_ms) {
+  ThreadInfo *tp = currentThread;
+  tp->wait_obj = obj;
+  tp->wait_timed = (timeout_ms != 0);
+  tp->wake_time = millis() + timeout_ms;
+  tp->flags = BLOCKED;
+}
+
+/*
+ * waitWhileBlocked() - Give up the CPU until wake() or the timeout
+ *
+ * Returns once the thread is no longer BLOCKED. Callers must recheck their
+ * condition since the thread may also have been woken by a timeout,
+ * restart(), or another thread consuming what it was waiting for.
+ */
+void Threads::waitWhileBlocked() {
+  ThreadInfo *tp = currentThread;
+  // getNextThread() does not schedule a BLOCKED thread, but thread 0 is
+  // always scheduled, and yield() returns at once if threading is stopped,
+  // so also check the timeout here (as sleep() does).
+  while (tp->flags == BLOCKED) {
+    __disable_irq();
+    if (tp->flags == BLOCKED && tp->wait_timed
+        && (int32_t)(millis() - tp->wake_time) >= 0) {
+      tp->flags = RUNNING;
+    }
+    __enable_irq();
+    if (tp->flags == BLOCKED) yield();
+  }
+  tp->wait_obj = NULL;
+}
+
+/*
+ * wake() - Make every thread BLOCKED on obj runnable again
+ *
+ * Call with interrupts disabled. Safe to call from an interrupt.
+ */
+void Threads::wake(const void *obj) {
+  for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next) {
+    if (tp->flags == BLOCKED && tp->wait_obj == obj) {
+      tp->wait_obj = NULL;
+      tp->flags = RUNNING;
+    }
+  }
+}
+
 int Threads::id() {
   volatile int ret;
   __disable_irq();
@@ -718,16 +801,34 @@ int Threads::id() {
   return ret;
 }
 
+/*
+ * Current stack pointer of a thread: live for thread 0 (MSP) and the
+ * running thread (PSP), otherwise as saved at its last context switch
+ */
+uint8_t *Threads::stackPointer(ThreadInfo *tp) {
+  void *sp;
+  if (tp == threadp) {
+    __asm volatile("mrs %0, msp" : "=r"(sp));
+  }
+  else if (tp == currentThread) {
+    __asm volatile("mrs %0, psp" : "=r"(sp));
+  }
+  else {
+    sp = tp->sp;
+  }
+  return (uint8_t*)sp;
+}
+
 int Threads::getStackUsed(int id) {
   ThreadInfo *tp = getThreadInfo(id);
   if (tp == NULL) return 0;
-  return tp->stack + tp->stack_size - (uint8_t*)tp->sp;
+  return tp->stack + tp->stack_size - stackPointer(tp);
 }
 
 int Threads::getStackRemaining(int id) {
   ThreadInfo *tp = getThreadInfo(id);
   if (tp == NULL) return 0;
-  return (uint8_t*)tp->sp - tp->stack;
+  return stackPointer(tp) - tp->stack;
 }
 
 char *Threads::threadsInfo(void)
@@ -856,4 +957,142 @@ int __attribute__ ((noinline)) Threads::Mutex::unlock() {
   __flush_cpu();
   threads.start(p);
   return 1;
+}
+
+
+/*
+ * Queue
+ *
+ * The queue is protected by disabling interrupts rather than with a Mutex,
+ * so it can also be used from interrupt handlers. PRIMASK is saved and
+ * restored so calls made with interrupts already disabled leave them that way.
+ */
+
+static inline uint32_t queue_irq_save() {
+  uint32_t primask;
+  __asm volatile("mrs %0, primask\n"
+                 "cpsid i" : "=r"(primask) : : "memory");
+  return primask;
+}
+
+static inline void queue_irq_restore(uint32_t primask) {
+  __asm volatile("msr primask, %0" : : "r"(primask) : "memory");
+}
+
+// A thread may only wait if it can yield: not inside an interrupt, and
+// not with interrupts disabled (an SVC with PRIMASK set is a HardFault)
+static inline bool queue_can_wait(uint32_t primask) {
+  uint32_t ipsr;
+  __asm volatile("mrs %0, ipsr" : "=r"(ipsr));
+  return ipsr == 0 && primask == 0;
+}
+
+Threads::QueueBase::QueueBase(uint8_t *buffer, size_t item_size, unsigned int capacity)
+  : buf(buffer), item_size(item_size), cap(capacity) {
+}
+
+bool Threads::QueueBase::put(const void *item, unsigned int timeout_ms, bool can_wait) {
+  uint32_t start = millis();
+  while (1) {
+    uint32_t primask = queue_irq_save();
+    if (used < cap) {
+      unsigned int tail = head + used;
+      if (tail >= cap) tail -= cap;
+      memcpy(buf + tail * item_size, item, item_size);
+      used = used + 1;
+      threads.wake(&readers);
+      queue_irq_restore(primask);
+      return true;
+    }
+    if (!can_wait || !queue_can_wait(primask)) {
+      queue_irq_restore(primask);
+      return false;
+    }
+    unsigned int remaining = 0;
+    if (timeout_ms) {
+      uint32_t elapsed = millis() - start;
+      if (elapsed >= timeout_ms) {
+        queue_irq_restore(primask);
+        return false;
+      }
+      remaining = timeout_ms - elapsed;
+    }
+    threads.block(&writers, remaining);
+    queue_irq_restore(primask);
+    threads.waitWhileBlocked();
+  }
+}
+
+bool Threads::QueueBase::get(void *item, unsigned int timeout_ms, bool can_wait) {
+  uint32_t start = millis();
+  while (1) {
+    uint32_t primask = queue_irq_save();
+    if (used > 0) {
+      memcpy(item, buf + head * item_size, item_size);
+      head = (head + 1 >= cap) ? 0 : head + 1;
+      used = used - 1;
+      threads.wake(&writers);
+      queue_irq_restore(primask);
+      return true;
+    }
+    if (!can_wait || !queue_can_wait(primask)) {
+      queue_irq_restore(primask);
+      return false;
+    }
+    unsigned int remaining = 0;
+    if (timeout_ms) {
+      uint32_t elapsed = millis() - start;
+      if (elapsed >= timeout_ms) {
+        queue_irq_restore(primask);
+        return false;
+      }
+      remaining = timeout_ms - elapsed;
+    }
+    threads.block(&readers, remaining);
+    queue_irq_restore(primask);
+    threads.waitWhileBlocked();
+  }
+}
+
+bool Threads::QueueBase::send(const void *item, unsigned int timeout_ms) {
+  return put(item, timeout_ms, true);
+}
+
+bool Threads::QueueBase::trySend(const void *item) {
+  return put(item, 0, false);
+}
+
+bool Threads::QueueBase::receive(void *item, unsigned int timeout_ms) {
+  return get(item, timeout_ms, true);
+}
+
+bool Threads::QueueBase::tryReceive(void *item) {
+  return get(item, 0, false);
+}
+
+bool Threads::QueueBase::peek(void *item) {
+  uint32_t primask = queue_irq_save();
+  bool ok = used > 0;
+  if (ok) memcpy(item, buf + head * item_size, item_size);
+  queue_irq_restore(primask);
+  return ok;
+}
+
+void Threads::QueueBase::clear() {
+  uint32_t primask = queue_irq_save();
+  head = 0;
+  used = 0;
+  threads.wake(&writers);
+  queue_irq_restore(primask);
+}
+
+unsigned int Threads::QueueBase::count() {
+  return used;
+}
+
+unsigned int Threads::QueueBase::space() {
+  uint32_t primask = queue_irq_save();
+  unsigned int ret = cap - used;
+  queue_irq_restore(primask);
+  return ret;
 }

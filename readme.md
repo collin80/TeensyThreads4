@@ -80,8 +80,17 @@ Once a thread ends because the function returns, then the thread will be reused
 by a new function.
 
 If a stack has been allocated by the library and not supplied by the caller, it
-will be freed when a new thread is added, not when it terminates. If the stack
-was supplied by the caller, the caller must free it if needed.
+is allocated together with the thread's internal state, which sits just above
+the top of the stack so a stack overflow cannot corrupt it. That memory is kept
+when the thread ends and is reused by a later `addThread()` that needs a stack
+of the same size or smaller. If the stack was supplied by the caller, the
+caller must free it if needed.
+
+A thread that overflows its stack is ended at its next context switch. Overflow
+is detected when the stack pointer is at the bottom of the stack, or when the
+marker word at the bottom has been overwritten. Memory below the stack may
+still have been damaged by then, so size stacks generously: `Serial.printf()`
+alone needs well over 1 KB.
 
 The following members of `class Threads` control threads. Items in all caps
 are constants in `Threads` and are accessed as in `Threads::EMPTY`.
@@ -89,7 +98,7 @@ are constants in `Threads` and are accessed as in `Threads::EMPTY`.
 Threads | Description
 --- | ---
 int id(); | Get the id of the currently running thread
-int getState(int id); | Get the state; see class constants. Can be EMPTY, RUNNING, ENDED, SUSPENDED.
+int getState(int id); | Get the state; see class constants. Can be EMPTY, RUNNING, ENDED, SUSPENDED, SLEEPING, BLOCKED.
 int wait(int id, unsigned int timeout_ms = 0) | Wait until thread ends, up to timeout_ms milliseconds. If 0, wait indefinitely.
 int kill(int id) | Permanently stop a running thread. Thread will end on the next thread slice tick.
 int suspend(int id) |Suspend a thread (on the next slice tick). Can be restarted with restart().
@@ -144,6 +153,66 @@ Scope(Mutex& m) | On creation, mutex is locked
     x = 2;
   }                           // unlock at end of scope
 ```
+
+Message queues
+-----------------------------
+
+`Threads::Queue<T, N>` is a thread safe FIFO queue holding up to `N` messages
+of type `T`, used to pass data between threads, and from interrupts to threads.
+`T` must be trivially copyable (numbers, pointers, plain structs). Storage is
+fixed at compile time; nothing is allocated from the heap.
+
+Threads::Queue<T, N> | Description
+--- | ---
+bool send(const T &item, unsigned int timeout_ms = 0) | Add item to the back, waiting up to timeout_ms milliseconds for space. If 0, wait indefinitely. Returns true if queued.
+bool trySend(const T &item) | Add item only if there is space now
+bool receive(T &item, unsigned int timeout_ms = 0) | Remove the front item into `item`, waiting up to timeout_ms milliseconds for one. If 0, wait indefinitely. Returns true if received.
+bool tryReceive(T &item) | Receive only if an item is available now
+bool peek(T &item) | Copy the front item without removing it; false if empty
+void clear() | Discard all queued items
+unsigned int count() | Number of items queued
+unsigned int space() | Number of free slots
+unsigned int capacity() | N
+bool isEmpty(), isFull() | Queue state
+
+A thread waiting in `send()` or `receive()` is put in the `BLOCKED` state and
+uses no CPU time until another thread or interrupt makes room or delivers a
+message (or its timeout expires). Any number of threads may send to and
+receive from the same queue. Thread 0 (`loop()`) can also wait, but since it
+is always scheduled, it polls by yielding rather than truly blocking.
+
+Interrupt handlers should use `trySend()`, `tryReceive()` and `peek()`. A
+blocking call made from an interrupt, or with interrupts disabled, never waits
+and behaves like its `try` version.
+
+Items are copied with interrupts briefly disabled, so keep messages small;
+to pass large buffers, send pointers to them.
+
+```C++
+struct Message { int sender; uint32_t value; };
+Threads::Queue<Message, 16> inbox;
+
+void worker() {
+  Message m;
+  while (1) {
+    inbox.receive(m);                   // BLOCKED until a message arrives
+    Serial.println(m.value);
+  }
+}
+
+void setup() {
+  threads.addThread(worker);
+}
+
+void loop() {
+  Message m = { 0, millis() };
+  if (!inbox.send(m, 100)) Serial.println("inbox full");  // wait up to 100 ms
+  threads.delay(1000);
+}
+```
+
+See the `MessageQueue` example for producers, a consumer and an interrupt
+sharing queues.
 
 Usage notes
 -----------------------------

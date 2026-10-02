@@ -71,6 +71,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <type_traits>
 
 extern "C" {
   void context_switch(void);
@@ -143,16 +144,27 @@ typedef struct {
 } software_stack_t;
 
 // The state of each thread (including thread 0)
+//
+// When the library allocates a thread's stack, the ThreadInfo is placed in
+// the same block, directly above the top of the stack:
+//
+//   low address  [ marker | stack (grows down) <- ][ ThreadInfo ]  high address
+//
+// so a thread that overflows its stack cannot overwrite its own ThreadInfo.
 class ThreadInfo {
   public:
     int stack_size;
     uint8_t *stack=0;
-    int my_stack = 0;
+    int my_stack = 0;                    // 1 if stack is this node's own block_stack
+    uint8_t *block_stack = 0;            // stack area allocated with this node, if any
+    int block_stack_size = 0;            // size of block_stack in bytes
     software_stack_t save;
     volatile int flags = 0;
     void *sp;
     int ticks;
-    volatile uint32_t wake_time = 0;     // millis() value at which a SLEEPING thread wakes
+    volatile uint32_t wake_time = 0;     // millis() value at which a SLEEPING (or timed BLOCKED) thread wakes
+    const void * volatile wait_obj = NULL; // object a BLOCKED thread is waiting on
+    volatile bool wait_timed = false;    // true if a BLOCKED thread should wake at wake_time
     unsigned long cyclesAccum = 0;       // total CPU cycles used (wraps around)
     uint32_t cyclesWindow = 0;           // cycles used in the current CPU usage window
     uint32_t cyclesLastWindow = 0;       // cycles used in the last completed CPU usage window
@@ -198,6 +210,7 @@ public:
   static const int ENDING = 3;
   static const int SUSPENDED = 4;
   static const int SLEEPING = 5;
+  static const int BLOCKED = 6;   // waiting on a Queue (or other wait object)
 
   static const int SVC_NUMBER = 0x21;
   static const int SVC_NUMBER_ACTIVE = 0x22;
@@ -322,10 +335,18 @@ protected:
   void *loadstack(ThreadFunction p, void * arg, void *stackaddr, int stack_size);
   static void force_switch_isr();
   void setStackMarker(void *stack);
+  ThreadInfo *newThreadInfo(int stack_size);
+  uint8_t *stackPointer(ThreadInfo *tp);
 
 private:
   static void del_process(void);
   void yield_and_start();
+
+  // Blocking primitives used by Queue. block() and wake() must be called with
+  // interrupts disabled; waitWhileBlocked() must be called with them enabled.
+  void block(const void *obj, unsigned int timeout_ms);
+  void waitWhileBlocked();
+  void wake(const void *obj);
 
 public:
   class Mutex {
@@ -338,6 +359,87 @@ public:
     int lock(unsigned int timeout_ms = 0); // lock, optionally waiting up to timeout_ms milliseconds
     int try_lock(); // if lock available, get it and return 1; otherwise return 0
     int unlock();   // unlock if locked
+  };
+
+  /*
+   * QueueBase is the untyped core of Queue: a fixed capacity ring buffer
+   * of item_size byte items. Use Queue<T, N> instead of this directly.
+   *
+   * All operations are safe to call from any thread. trySend(), tryReceive()
+   * and peek() are also safe from interrupts. A blocking call made from an
+   * interrupt (or with interrupts disabled) behaves like its try version.
+   *
+   * Items are copied with interrupts disabled, so keep them small; to pass
+   * large messages, send pointers to them instead.
+   */
+  class QueueBase {
+  public:
+    // Copy item onto the back of the queue, waiting up to timeout_ms
+    // milliseconds for space. If timeout_ms is 0, wait indefinitely.
+    // Returns true if the item was queued.
+    bool send(const void *item, unsigned int timeout_ms = 0);
+    // Queue item only if there is space right now
+    bool trySend(const void *item);
+    // Remove the front item into *item, waiting up to timeout_ms
+    // milliseconds for one to arrive. If timeout_ms is 0, wait indefinitely.
+    // Returns true if an item was received.
+    bool receive(void *item, unsigned int timeout_ms = 0);
+    // Receive only if an item is available right now
+    bool tryReceive(void *item);
+    // Copy the front item into *item without removing it; false if empty
+    bool peek(void *item);
+    // Discard all queued items
+    void clear();
+
+    unsigned int count();     // number of items queued
+    unsigned int space();     // number of free slots
+    unsigned int capacity() { return cap; }
+    bool isEmpty() { return count() == 0; }
+    bool isFull() { return space() == 0; }
+
+  protected:
+    QueueBase(uint8_t *buffer, size_t item_size, unsigned int capacity);
+
+  private:
+    QueueBase(const QueueBase &) = delete;
+    QueueBase &operator=(const QueueBase &) = delete;
+    bool put(const void *item, unsigned int timeout_ms, bool can_wait);
+    bool get(void *item, unsigned int timeout_ms, bool can_wait);
+
+    uint8_t *buf;
+    size_t item_size;
+    unsigned int cap;
+    volatile unsigned int head = 0;   // index of the front item
+    volatile unsigned int used = 0;   // number of items queued
+    // Only the addresses of these matter: they identify what a BLOCKED thread waits for
+    uint8_t readers = 0;              // threads waiting for an item
+    uint8_t writers = 0;              // threads waiting for space
+  };
+
+  /*
+   * Thread safe FIFO message queue holding up to N items of type T.
+   * T must be trivially copyable (plain structs, numbers, pointers).
+   *
+   *   Threads::Queue<Message, 16> q;
+   *   q.send(msg);              // waits while full
+   *   if (q.receive(msg, 100))  // waits up to 100 ms for a message
+   *
+   * A thread waiting in send() or receive() is BLOCKED and uses no CPU time
+   * until another thread or interrupt makes room or delivers an item.
+   */
+  template <class T, unsigned int N> class Queue : public QueueBase {
+    static_assert(N > 0, "Queue capacity must be at least 1");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "Queue items must be trivially copyable; send a pointer instead");
+  private:
+    alignas(T) uint8_t storage[N * sizeof(T)];
+  public:
+    Queue() : QueueBase(storage, sizeof(T), N) {}
+    bool send(const T &item, unsigned int timeout_ms = 0) { return QueueBase::send(&item, timeout_ms); }
+    bool trySend(const T &item) { return QueueBase::trySend(&item); }
+    bool receive(T &item, unsigned int timeout_ms = 0) { return QueueBase::receive(&item, timeout_ms); }
+    bool tryReceive(T &item) { return QueueBase::tryReceive(&item); }
+    bool peek(T &item) { return QueueBase::peek(&item); }
   };
 
   class Scope {
