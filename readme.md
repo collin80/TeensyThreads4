@@ -1,11 +1,12 @@
-Teensy Threading Library
+Teensy Threading Library (Enhanced)
 ===================================================
 
-Teensy Threading Library implements preemptive threads for the Teensy 3 & 4
+Teensy Threading Library implements preemptive threads for the Teensy 4
 platform from [PJRC](https://www.pjrc.com/teensy/index.html). It supports a
-native interface and a `std::thread` interface.
+native interface and a `std::thread` interface. Also supports message passing
+between threads.
 
-Official repsitory https://github.com/ftrias/TeensyThreads
+Official repsitory of original library: https://github.com/ftrias/TeensyThreads
 
 Simple example
 ------------------------------
@@ -415,18 +416,19 @@ Revision 0.3: April 2017
 Revision 0.4: July 2017
 1. Make ThreadInfo dynamic, saving memory for unused threads
 
+Revision 0.5 Oct 2026
+1. Add Message queue system so threads can send messages in a safe way
+2. Fixed up many edge cases to work the way things were always supposed to
+3. Removed support for Teensy 3 processors (gets rid of some ifdef blocks, tidy up code)
+4. Moved CPU usage tracking out of DEBUG and into full time usage. Now it always happens
+5. ThreadInfo now stored as a linked list so many threads are possible now (limited by memory)
+6. Better tracking of why a thread is not running (sleeping, suspended, blocked on message reading)
+
 Other
 -----------------------------
 
-See this thread for development discussion:
-
-https://forum.pjrc.com/threads/41504-Teensy-3-x-multithreading-library-first-release
-
-This project came about because I was coding a Teensy application with multiple
-things happening at the same time, wistfully reminiscing about multithreading
-available in other OSs. I searched for threading tools, but found nothing for my
-situation. This combined with boredom and abundant free time resulting in
-complete overkill for the solution and thus this implementation of preemptive
-threads.
-
 Copyright 2017 by Fernando Trias. See license.txt for details.
+
+Modifications by Claude via Collin Kidder in 2026. So, thank whomever's code Claude
+processed/stole to be able to generate the additions. Collin mostly supervised and
+tested the code, Claude did most of the work (credit where credit is due!)
