@@ -38,14 +38,14 @@ unsigned int time_end;
 // They are copies or pointers to data in Threads and ThreadInfo
 // and put here seperately in order to simplify the code.
 extern "C" {
-  int currentUseSystick;      // using Systick vs PIT/GPT
-  int currentActive;          // state of the system (first, start, stop)
-  int currentCount;
-  ThreadInfo *currentThread;  // the thread currently running
-  void *currentSave;
-  int currentMSP;             // Stack pointers to save
-  void *currentSP;
-  void loadNextThread() {
+  __attribute__((used)) int currentUseSystick;      // using Systick vs PIT/GPT
+  __attribute__((used)) int currentActive;          // state of the system (first, start, stop)
+  __attribute__((used)) int currentCount;
+  __attribute__((used)) ThreadInfo *currentThread;  // the thread currently running
+  __attribute__((used)) void *currentSave;
+  __attribute__((used)) int currentMSP;             // Stack pointers to save
+  __attribute__((used)) void *currentSP;
+  __attribute__((used)) void loadNextThread() {
     threads.getNextThread();
   }
 }
@@ -296,6 +296,9 @@ void Threads::getNextThread() {
   uint32_t window_length = now - cpu_window_start;
   if (window_length >= cpu_window_ms * (F_CPU_ACTUAL / 1000)) {
     for (ThreadInfo *tp = threadp; tp != NULL; tp = tp->next) {
+      // Fold the window into the float total here rather than on every
+      // switch: adding whole windows keeps float rounding error small
+      tp->secondsAccum += (float)tp->cyclesWindow / (float)F_CPU_ACTUAL;
       tp->cyclesLastWindow = tp->cyclesWindow;
       tp->cyclesWindow = 0;
     }
@@ -561,6 +564,7 @@ int Threads::addThread(ThreadFunction p, void * arg, int stack_size, void *stack
   tp->cyclesAccum = 0;
   tp->cyclesWindow = 0;
   tp->cyclesLastWindow = 0;
+  tp->secondsAccum = 0;
   tp->generation++; // lets wait() tell this thread apart from an earlier one with the same id
   tp->flags = RUNNING;
 
@@ -850,9 +854,10 @@ char *Threads::threadsInfo(void)
     _buffer_cursor += sprintf(_buffer + _buffer_cursor, "State:%s|",
                               _thread_state);
     int cpu_tenths = (int)(getCPUUsage(tp->id) * 10.0f + 0.5f);
-    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "CPU:%d.%d%%|cycles:%lu\n",
+    unsigned long run_ms = (unsigned long)(getSecondsUsed(tp->id) * 1000.0f + 0.5f);
+    _buffer_cursor += sprintf(_buffer + _buffer_cursor, "CPU:%d.%d%%|cycles:%lu|time:%lu.%03lus\n",
                               cpu_tenths / 10, cpu_tenths % 10,
-                              tp->cyclesAccum);
+                              tp->cyclesAccum, run_ms / 1000, run_ms % 1000);
   }
   return _buffer;
 }
@@ -864,6 +869,16 @@ unsigned long Threads::getCyclesUsed(int id) {
   unsigned long ret = tp->cyclesAccum;
   __enable_irq();
   return ret;
+}
+
+float Threads::getSecondsUsed(int id) {
+  ThreadInfo *tp = getThreadInfo(id);
+  if (tp == NULL) return 0.0f;
+  __disable_irq();
+  float seconds = tp->secondsAccum;
+  uint32_t pending = tp->cyclesWindow;
+  __enable_irq();
+  return seconds + (float)pending / (float)F_CPU_ACTUAL;
 }
 
 float Threads::getCPUUsage(int id) {

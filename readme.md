@@ -114,6 +114,7 @@ int stop() | Stop threading system; returns previous state: STARTED, STOPPED, FI
 float getCPUUsage(int id) | Percentage of CPU time (0-100) used by a thread during the last completed measurement window. Interrupt time is charged to the interrupted thread.
 void setCPUUsageWindow(unsigned int ms) | Set the CPU usage measurement window in milliseconds (default 1000, max 4000)
 unsigned long getCyclesUsed(int id) | Total CPU cycles used by a thread since it was created (wraps around)
+float getSecondsUsed(int id) | Total time in seconds a thread has run since it was created. Does not wrap. Includes time up to the thread's last context switch.
 **Advanced functions** |
 void setDefaultStackSize(unsigned int bytes_size) | Set the stack size for new threads in bytes
 void setTimeSlice(int id, unsigned int ticks) | Set the slice length time in ticks for a thread (1 tick = 1 millisecond, unless using MicroTimer)

@@ -168,6 +168,7 @@ class ThreadInfo {
     unsigned long cyclesAccum = 0;       // total CPU cycles used (wraps around)
     uint32_t cyclesWindow = 0;           // cycles used in the current CPU usage window
     uint32_t cyclesLastWindow = 0;       // cycles used in the last completed CPU usage window
+    float secondsAccum = 0;              // total run time in seconds, excluding the current cyclesWindow
     int id = 0;                          // thread id returned by addThread()
     volatile uint32_t generation = 0;    // incremented each time addThread() (re)uses this node
     ThreadInfo *next = NULL;             // next thread in the list (NULL at end)
@@ -299,6 +300,8 @@ public:
   char* threadsInfo(void);
   // Total CPU cycles used by a thread since it was created (wraps around)
   unsigned long getCyclesUsed(int id);
+  // Total time in seconds a thread has run since it was created (does not wrap)
+  float getSecondsUsed(int id);
   // Percentage of CPU time (0-100) used by a thread during the last completed
   // measurement window. Time spent in interrupts is charged to the interrupted thread.
   float getCPUUsage(int id);
